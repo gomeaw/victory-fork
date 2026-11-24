@@ -1,0 +1,43 @@
+name: Shader page-fault validation
+on:
+  push:
+    branches: [validation/shader-page-fault-writes]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - name: Baseline negative control and timing
+        run: |
+          git checkout 780295352a2be0c324a20db98cb87d32d30b2b25
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $PSNativeCommandUseErrorActionPreference = $false
+          $output = cargo test --locked -p victory-shader --lib resident_and_masked_lanes_leave_the_fault_sink_alone -- --ignored --nocapture 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $output
+          if ($code -eq 0 -or $output -notmatch 'fault sink was written') { throw 'Expected only the baseline sink assertion to fail' }
+          cargo test --locked -p victory-shader --lib resident_page_lookup_cost -- --ignored --nocapture
+      - name: Patched correctness and timing
+        run: |
+          git checkout $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p victory-shader --lib a_wide_box_crossing_two_title_pages -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p victory-shader --lib resident_and_masked_lanes_leave_the_fault_sink_alone -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p victory-shader --lib resident_page_lookup_cost -- --ignored --nocapture
+  workspace:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --locked
