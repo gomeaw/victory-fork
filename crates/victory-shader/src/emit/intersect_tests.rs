@@ -773,8 +773,8 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
 /// The node test in a loop: `program`'s instruction run `iterations` times
 /// per thread, each result's lowest bit folded into the ray's origin so
 /// that every pass needs the one before and none can leave the loop.
-fn looped(iterations: u16) -> Vec<u32> {
-    let mut w = program(true, Descriptor::Table);
+fn looped(iterations: u16, descriptor: Descriptor) -> Vec<u32> {
+    let mut w = program(true, descriptor);
     let at = w
         .iter()
         .position(|&x| x == 0xF19C_9F07)
@@ -812,7 +812,11 @@ fn node_test_cost() {
         eprintln!("no SM 6.6 hardware device; skipped");
         return;
     };
-    let lowered = |iterations| build_words(&looped(iterations)).expect("the loop lowers").0;
+    let lowered = |iterations| {
+        build_words(&looped(iterations, Descriptor::Table))
+            .expect("the loop lowers")
+            .0
+    };
     let (scene, batches) = scene();
     let all: Vec<Case> = batches.into_iter().flatten().collect();
     let of = |kinds: std::ops::RangeInclusive<u32>| -> Vec<Case> {
@@ -883,4 +887,127 @@ fn node_test_cost() {
             per * 1e12,
         );
     }
+}
+
+/// Exercise the real directory and fault UAV on WARP. One 128-byte node
+/// spans two independently bound host buffers.
+fn resident_node_dispatch(
+    host: &Host,
+    shader: &HostShader,
+    groups: u32,
+    mixed: bool,
+    iterations: u16,
+) -> (Vec<Vec<u32>>, std::time::Duration) {
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    let base = shader
+        .user_data
+        .iter()
+        .find(|w| w.root == RootType::Other(super::USER_MEMORY_BASE))
+        .unwrap();
+    constants[base.index as usize] = 1;
+    assert_eq!(shader.root_uavs, [super::SLOT_FAULTS]);
+    assert_eq!(shader.root_srvs, [super::SLOT_MEMORY]);
+
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 20.0);
+    let node = nodes::box32(
+        [bvh::NONE, bvh::NONE, bvh::NONE, 25],
+        [
+            [f32::NAN; 6],
+            [f32::NAN; 6],
+            [f32::NAN; 6],
+            [4.0, -1.0, -1.0, 6.0, 1.0, 1.0],
+        ],
+    );
+    let mut scene = Scene::new();
+    let n = scene.add(node, 32);
+    let cases = vec![Some((n, 5, ray)); THREADS as usize];
+    let mut records = buffer(&scene, &cases, 0x1ffc0);
+    records.truncate((NODES / 4) as usize);
+    // Use reserved kind 7 for the missing pages. The instruction still
+    // looks up the directory but does not load node bytes from them.
+    let words = (RECORD / 4) as usize;
+    if mixed {
+        records[words] = (0x30000 >> 3) | 7; // Active lookup of absent page 3.
+        records[2 * words] = (0x40000 >> 3) | 7;
+        records[2 * words + 12] = 0; // Masked lookup of absent page 4.
+    }
+    let mut first = vec![0; 65536 / 4];
+    first[0xffc0 / 4..].copy_from_slice(&node[..16]);
+    let mut faults = vec![0; super::MEMORY_FAULTS as usize];
+    faults[0] = 0x12_3456;
+
+    let (root, pso) = host.compute_pipeline(shader).unwrap();
+    let started = std::time::Instant::now();
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(constants)),
+                    (1, Root::OutputUav(3)),
+                    (2, Root::View {
+                        srv: true,
+                        data: vec![0, 0, 1, 0, 2, 0, 0, 0, 0, 0],
+                    }),
+                ],
+                views: &[
+                    View::Buffer { data: &records, stride: Stride::Raw },
+                    View::RawUav(4 * THREADS),
+                    View::RawUavData(&first),
+                    View::RawUavData(&node[16..]),
+                    View::RawUavData(&faults),
+                ],
+                samplers: &[],
+                groups: [groups, 1, 1],
+            },
+        )
+        .unwrap();
+    let elapsed = started.elapsed();
+    let mut ray = ray;
+    let mut expected = BEFORE;
+    for _ in 0..iterations {
+        expected = bvh::intersect(&node, 5, &ray, true);
+        ray.origin[0] = f32::from_bits(ray.origin[0].to_bits() ^ (expected[0] & 1));
+    }
+    assert_eq!(expected[0], 25);
+    for (thread, result) in out[0].chunks_exact(4).enumerate() {
+        let want = match thread {
+            1 if mixed => bvh::MISS.map(f32::to_bits),
+            2 if mixed => BEFORE,
+            _ => expected,
+        };
+        assert_eq!(result, want, "thread {thread}");
+    }
+    (out, elapsed)
+}
+
+#[test]
+#[ignore = "validation: requires WARP 6.6"]
+fn resident_and_masked_lanes_leave_the_fault_sink_alone() {
+    let host = Host::new(true).expect("requires WARP 6.6");
+    let (shader, _) = build(true, WHOLE).unwrap();
+    let (out, _) = resident_node_dispatch(&host, &shader, 1, true, 1);
+    // Keep the sentinel assertion last so the baseline proves real faults
+    // and the masked guard are both working before the negative control.
+    assert_eq!(out[3][4], 3, "active lane reports page 3");
+    assert!(out[3][1..].iter().enumerate().all(|(i, &p)| i == 3 || p == 0));
+    assert_eq!(out[3][0], 0x12_3456, "fault sink was written");
+}
+
+#[test]
+#[ignore = "validation: WARP synthetic resident-page benchmark"]
+fn resident_page_lookup_cost() {
+    let host = Host::new(true).expect("requires WARP 6.6");
+    const ITERATIONS: u16 = 96;
+    let (shader, _) = build_words(&looped(ITERATIONS, WHOLE)).unwrap();
+    let _ = resident_node_dispatch(&host, &shader, 128, false, ITERATIONS);
+    let mut ms: Vec<f64> = (0..9)
+        .map(|_| {
+            let (_, elapsed) = resident_node_dispatch(&host, &shader, 128, false, ITERATIONS);
+            elapsed.as_secs_f64() * 1_000.0
+        })
+        .collect();
+    ms.sort_by(f64::total_cmp);
+    eprintln!("resident page lookup: median {:.3} ms, samples {ms:?}", ms[4]);
 }
