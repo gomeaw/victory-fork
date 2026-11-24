@@ -72,7 +72,13 @@ shaders and emulates the one instruction.
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
-- Cost on the GPU is unmeasured.
+- Cost on the GPU: only the node test itself is measured. On an RTX 5070
+  the emulated test runs at about 49 G box-node tests and 92 G triangle-node
+  tests a second across the card, with nodes in cache
+  (`intersect_tests::node_test_cost`, an ignored benchmark). At 1080p, 30
+  node visits a ray and one ray a pixel, that is at most about 1.3 ms of arithmetic
+  a frame; fetching nodes through title memory, traversal and divergence
+  are not in it and are unmeasured.
 
 ## Where to look
 

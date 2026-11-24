@@ -162,7 +162,12 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_words(&program(wide, descriptor))
+}
+
+/// Lowers a program of these words, as [`build`].
+fn build_words(words: &[u32]) -> Result<(HostShader, resource::Resources), ShaderError> {
+    let native = native(words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
@@ -762,5 +767,120 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
             assert_eq!(what, "a ray-tracing structure that returns triangle ids");
         }
         other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+/// The node test in a loop: `program`'s instruction run `iterations` times
+/// per thread, each result's lowest bit folded into the ray's origin so
+/// that every pass needs the one before and none can leave the loop.
+fn looped(iterations: u16) -> Vec<u32> {
+    let mut w = program(true, Descriptor::Table);
+    let at = w
+        .iter()
+        .position(|&x| x == 0xF19C_9F07)
+        .expect("the instruction");
+    let mut body = vec![0xB015_0000 | u32::from(iterations)]; // s_movk_i32 s21, iterations
+    body.extend(w.drain(at..at + 5));
+    body.extend([
+        0x362C_1A81, // v_and_b32 v22, 1, v13
+        0x3A08_0916, // v_xor_b32 v4, v22, v4
+        0x8095_8115, // s_sub_u32 s21, s21, 1
+        0xBF07_8015, // s_cmp_lg_u32 s21, 0
+    ]);
+    // s_cbranch_scc1 back to the instruction, past the s_movk
+    let back = -(body.len() as i16);
+    body.push(0xBF85_0000 | u32::from(back as u16));
+    w.splice(at..at, body);
+    w
+}
+
+/// What the emulated node test costs on the card, per kind of node (a
+/// benchmark: `cargo test --release -p victory-shader node_test_cost --
+/// --ignored --nocapture`). Every group runs the same 32 records, so the
+/// nodes stay in the card's caches: this is the test's arithmetic, not the
+/// fetching of nodes from a large structure. Timed on the CPU around whole
+/// dispatches; a one-pass run's time is taken off, which leaves out the
+/// setup and copies each dispatch makes.
+#[test]
+#[ignore = "benchmark: cargo test --release -p victory-shader node_test_cost -- --ignored --nocapture"]
+fn node_test_cost() {
+    const GROUPS: u32 = 65535;
+    // Below the translator's limit on a compute loop's passes (4,096, see
+    // `Lower::count_iteration`), past which the loop stops early.
+    const ITERATIONS: u16 = 4000;
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let lowered = |iterations| build_words(&looped(iterations)).expect("the loop lowers").0;
+    let (scene, batches) = scene();
+    let all: Vec<Case> = batches.into_iter().flatten().collect();
+    let of = |kinds: std::ops::RangeInclusive<u32>| -> Vec<Case> {
+        all.iter()
+            .filter(|c| matches!(c, Some((_, k, _)) if kinds.contains(k)))
+            .copied()
+            .cycle()
+            .take(THREADS as usize)
+            .collect()
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let run = |shader: &HostShader, data: &[u32], groups: u32| {
+        let (root, pso) = host.compute_pipeline(shader).expect("compute_pipeline");
+        host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; 5]))],
+                views: &[
+                    View::Buffer {
+                        data,
+                        stride: Stride::Raw,
+                    },
+                    View::RawUav(4 * THREADS),
+                ],
+                samplers: &[],
+                groups: [groups, 1, 1],
+            },
+        )
+        .expect("dispatch")
+    };
+    // The fastest of a few runs, in seconds.
+    let time = |shader: &HostShader, data: &[u32]| -> f64 {
+        (0..5)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                run(shader, data, GROUPS);
+                start.elapsed().as_secs_f64()
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let (long, short) = (lowered(ITERATIONS), lowered(1));
+    let passes = f64::from(GROUPS * THREADS) * f64::from(ITERATIONS - 1);
+    for (label, kinds) in [
+        ("box nodes (16- and 32-bit bounds)", 4..=5),
+        ("triangle nodes", 0..=3),
+    ] {
+        let cases = of(kinds);
+        let data = buffer(&scene, &cases, u64::from(NODES));
+        // Every pass ran: the last result is the reference's after as many.
+        let out = run(&long, &data, 1);
+        for (t, case) in cases.iter().enumerate() {
+            let Some((n, kind, ray)) = case else { continue };
+            let mut ray = *ray;
+            let mut result = BEFORE;
+            for _ in 0..ITERATIONS {
+                result = bvh::intersect(&scene.node(*n), *kind, &ray, true);
+                ray.origin[0] = f32::from_bits(ray.origin[0].to_bits() ^ (result[0] & 1));
+            }
+            assert_eq!(&out[0][4 * t..4 * t + 4], result, "{label}, thread {t}");
+        }
+        let per = (time(&long, &data) - time(&short, &data)) / passes;
+        eprintln!(
+            "{label}: {:.1} G tests/s across the card ({:.1} ps a test)",
+            1e-9 / per,
+            per * 1e12,
+        );
     }
 }
