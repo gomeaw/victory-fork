@@ -630,6 +630,82 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
 }
 
 #[test]
+#[ignore = "requires the Windows WARP software adapter with shader model 6.6"]
+fn a_wide_box_crossing_two_title_pages_reads_both_host_copies() {
+    let host = Host::new(true).expect("requires SM 6.6 WARP");
+    let (shader, _) = build(true, WHOLE).expect("lowers through the production directory");
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .expect("WARP compute pipeline");
+    assert_eq!(shader.root_uavs, [super::SLOT_FAULTS]);
+    assert_eq!(shader.root_srvs, [super::SLOT_MEMORY]);
+    assert!(shader.root_cbvs.is_empty());
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    let base = shader
+        .user_data
+        .iter()
+        .find(|w| w.root == RootType::Other(super::shader::USER_MEMORY_BASE))
+        .expect("directory view base");
+    constants[base.index as usize] = 1;
+
+    // At byte 0x1ffc0, the first 64 bytes are in page 1 and the rest in
+    // page 2. Child 3's six bounds are all in page 2; its ID is in page 1.
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 20.0);
+    for y in [0.0, 4.0] {
+        let node = nodes::box32(
+            [bvh::NONE, bvh::NONE, bvh::NONE, 24],
+            [
+                [f32::NAN; 6],
+                [f32::NAN; 6],
+                [f32::NAN; 6],
+                [4.0, y - 1.0, -1.0, 6.0, y + 1.0, 1.0],
+            ],
+        );
+        let mut scene = Scene::new();
+        let n = scene.add(node, 32);
+        let mut records = buffer(&scene, &[Some((n, 5, ray))], 0x1ffc0);
+        records.truncate((NODES / 4) as usize);
+        let mut first = vec![0; 65536 / 4];
+        first[0xffc0 / 4..].copy_from_slice(&node[..16]);
+        let expected = bvh::intersect(&node, 5, &ray, true);
+        assert_eq!(expected[0], if y == 0.0 { 24 } else { bvh::NONE });
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(constants.clone())),
+                        (1, Root::OutputUav(3)),
+                        (
+                            2,
+                            Root::View {
+                                srv: true,
+                                data: vec![0, 0, 1, 0, 2, 0],
+                            },
+                        ),
+                    ],
+                    views: &[
+                        View::Buffer {
+                            data: &records,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                        View::RawUavData(&first),
+                        View::RawUavData(&node[16..]),
+                        View::RawUav(super::shader::MEMORY_FAULTS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch through separate backing resources");
+        assert_eq!(&out[0][..4], &expected);
+        assert!(out[3][1..].iter().all(|&p| p == 0), "unexpected page fault");
+    }
+}
+
+#[test]
 fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     for wide in [true, false] {
         let native = native(&program(wide, WHOLE));
