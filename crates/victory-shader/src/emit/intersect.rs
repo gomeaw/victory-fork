@@ -251,7 +251,6 @@ impl<'a> Lower<'a> {
     /// computed, `offset` fixed; none of the node's bytes past 127), read
     /// four at a time.
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         // The second half of a 128-byte node may lie in the next 64 KiB
         // page, which may be in another copy: its own look, made once.
@@ -268,9 +267,10 @@ impl<'a> Lower<'a> {
                     // Every lane in this block runs the instruction.
                     let (handle, byte) = self.bvh_memory(low, high, None);
                     let k64 = self.s.m.i32(64);
-                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
+                    (handle, self.s.m.bin(self.cur, Bin::Sub, byte, k64))
                 }),
             };
+            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -330,21 +330,23 @@ impl<'a> Lower<'a> {
         let k16 = self.s.m.i32(16);
         let words = self.bvh_node_words(at, None, 16, 24);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        self.s.m.terminate(wide_block, Term::Br(join));
+        let wide_end = self.cur;
+        self.s.m.terminate(wide_end, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
         let words = self.bvh_node_words(at, None, 16, 12);
+        let half_end = self.cur;
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
             let mut h = words[n / 2];
             if n % 2 == 1 {
-                h = self.s.m.bin(half_block, Bin::LShr, h, k16);
+                h = self.s.m.bin(half_end, Bin::LShr, h, k16);
             }
             // The conversion reads the low 16 bits.
             halves.push(self.s.op(
-                half_block,
+                half_end,
                 "legacyF16ToF32",
                 Attr::ReadNone,
                 f32t,
@@ -352,14 +354,14 @@ impl<'a> Lower<'a> {
                 &[h],
             ));
         }
-        self.s.m.terminate(half_block, Term::Br(join));
+        self.s.m.terminate(half_end, Term::Br(join));
         self.cur = join;
         let mut coords = Vec::with_capacity(24);
         for n in 0..24 {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_end)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).

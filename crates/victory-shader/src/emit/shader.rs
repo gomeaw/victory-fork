@@ -42,7 +42,7 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
-///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
+///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 unused), which the
 ///   host reads afterwards to make those copies for the frames to come.
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
