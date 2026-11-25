@@ -1,0 +1,35 @@
+name: Texture change validation
+on:
+  push:
+    branches: [validation/texture-changes-current-main]
+permissions:
+  contents: read
+env:
+  VICTORY_D3D12_WARP: '1'
+jobs:
+  texture-tests:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Original code drops the early notification
+        run: |
+          git restore --source=6816df6 -- crates/victory-gpu/src/descriptor/host.rs crates/victory-gpu/src/host.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $PSNativeCommandUseErrorActionPreference = $false
+          $output = cargo test --locked -p victory-gpu --features diagnostics --lib a_streaming_burst_keeps_earlier_texture_changes -- --nocapture 2>&1 | Out-String
+          $status = $LASTEXITCODE
+          Write-Host $output
+          if ($status -eq 0 -or $output -notmatch 'the earliest texture change must survive a streaming burst') {
+            throw 'The original code must lose the early notification'
+          }
+          exit 0
+      - name: Patched descriptor and texture queue tests
+        run: |
+          git restore --source=$env:GITHUB_SHA -- crates/victory-gpu/src/descriptor/host.rs crates/victory-gpu/src/host.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p victory-gpu --features diagnostics --lib descriptor::host::tests -- --nocapture --test-threads=1

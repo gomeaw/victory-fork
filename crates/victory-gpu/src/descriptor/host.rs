@@ -3519,9 +3519,7 @@ mod tests {
             "the earliest texture change must survive a streaming burst"
         );
 
-        let Some(heap) = HostHeap::new(false, 8) else {
-            return; // no host GPU
-        };
+        let heap = HostHeap::new(false, 8).expect("the WARP descriptor heap must be available");
         assert!(heap.note_buffer(1, Some(&view), false).is_empty());
         let (slot, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(slot, 1);
