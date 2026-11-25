@@ -200,6 +200,142 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[derive(Clone, Copy, Debug)]
+enum TitleAccess {
+    GlobalLoad,
+    GlobalStore,
+    ScalarLoad,
+}
+
+fn title_memory_shader(access: TitleAccess, count: u8) -> HostShader {
+    let mut body = Vec::new();
+    match access {
+        TitleAccess::GlobalLoad | TitleAccess::GlobalStore => {
+            let width = [0, 1, 3, 2][usize::from(count - 1)];
+            let flat = 0xDC00_8000;
+            let addr = 1; // v[1:2] holds the first two root constants.
+            match access {
+                TitleAccess::GlobalLoad => {
+                    body.extend([flat | ((0x0C + width) << 18), 4 << 24 | 0x7D << 16 | addr]);
+                    for k in 0..count {
+                        body.extend(buffer_store_dword(4 + k, 8, 4 * u16::from(k + 1)));
+                    }
+                }
+                TitleAccess::GlobalStore => {
+                    for k in 0..count {
+                        body.push(vop1(0x001, 4 + k, 128 + 20 + u16::from(k)));
+                    }
+                    body.extend([flat | ((0x1C + width) << 18), 0x7D << 16 | 4 << 8 | addr]);
+                }
+                TitleAccess::ScalarLoad => unreachable!(),
+            }
+        }
+        TitleAccess::ScalarLoad => {
+            // s_load_dword[xN] s[16:...], s[0:1], 0.
+            body.extend([0xF400_0400 | (count.ilog2() << 18), 125 << 25]);
+            for k in 0..count {
+                body.push(vop1(0x001, 4, sgpr(16 + k)));
+                body.extend(buffer_store_dword(4, 8, 4 * u16::from(k + 1)));
+            }
+        }
+    }
+    build_valu_cs(&body)
+}
+
+#[test]
+fn wide_title_memory_accesses_follow_both_page_mappings() {
+    use super::{MEMORY_FAULTS, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(true).expect("SM 6.6 WARP");
+    const PAGE_DWORDS: usize = 0x10000 / 4;
+    const NEXT_PAGE: usize = 0x10000; // High address dword carries at 4 GiB.
+    const FIRST_BIAS: usize = 4;
+    const NEXT_BIAS: usize = 8;
+    let first_end = FIRST_BIAS + PAGE_DWORDS;
+    // The first buffer continues after its mapped page. Its extra dwords
+    // stand for unrelated data, so a misplaced read or write is visible.
+    let first = vec![0x11; first_end + 4];
+    let next = vec![0x22; NEXT_BIAS + 16];
+    let mut directory = vec![0; 2 * (NEXT_PAGE + 1)];
+    directory[2 * (NEXT_PAGE - 1)..2 * NEXT_PAGE]
+        .copy_from_slice(&[1, 4 * FIRST_BIAS as u32]);
+
+    for (access, widths) in [
+        (TitleAccess::GlobalLoad, &[1, 2, 3, 4][..]),
+        (TitleAccess::GlobalStore, &[1, 2, 3, 4][..]),
+        (TitleAccess::ScalarLoad, &[1, 2, 4, 8, 16][..]),
+    ] {
+        for &count in widths {
+            let shader = title_memory_shader(access, count);
+            assert_eq!(shader.root_uavs, [SLOT_FAULTS]);
+            assert_eq!(shader.root_srvs, [SLOT_MEMORY]);
+            let (root, pso) = host.compute_pipeline(&shader).expect("WARP pipeline");
+            for (before, missing) in (1..=count).map(|n| (n, false)).chain(
+                // With the first dword resident, only the second page faults.
+                (count > 1).then_some((1, true)),
+            ) {
+                let address = 0u32.wrapping_sub(u32::from(before) * 4);
+                let mut constants = vec![0; shader.user_data_dwords() as usize];
+                for word in &shader.user_data {
+                    constants[word.index as usize] = match (word.root, word.dword) {
+                        (RootType::Constants, 0) => address,
+                        (RootType::Constants | RootType::Table, _) => 0,
+                        (RootType::Other(USER_MEMORY_BASE), _) => 1,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let entry = if missing { [0, 0] } else { [2, 4 * NEXT_BIAS as u32] };
+                directory[2 * NEXT_PAGE..].copy_from_slice(&entry);
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(constants)),
+                                (1, Root::OutputUav(3)),
+                                (2, Root::View { srv: true, data: directory.clone() }),
+                            ],
+                            views: &[
+                                View::RawUav(u32::from(count) + 1),
+                                View::NullRawUav,
+                                View::RawUavData(&first),
+                                View::RawUavData(&next),
+                                View::RawUavData(&[0; MEMORY_FAULTS as usize]),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("run with two independent title-memory pages");
+                let case = format!("{access:?} x{count}, {before} words before boundary, missing={missing}");
+                if matches!(access, TitleAccess::GlobalStore) {
+                    let mut expected_first = first.clone();
+                    let mut expected_next = next.clone();
+                    for k in 0..count {
+                        if k < before {
+                            expected_first[first_end - usize::from(before - k)] = 20 + u32::from(k);
+                        } else if !missing {
+                            expected_next[NEXT_BIAS + usize::from(k - before)] = 20 + u32::from(k);
+                        }
+                    }
+                    assert_eq!(&out[1][first_end - 4..], &expected_first[first_end - 4..], "first copy: {case}");
+                    assert_eq!(out[2], expected_next, "second copy: {case}");
+                } else {
+                    let expected: Vec<_> = (0..count)
+                        .map(|k| if k < before { 0x11 } else if missing { 0 } else { 0x22 })
+                        .collect();
+                    assert_eq!(&out[0][1..], expected, "load values: {case}");
+                }
+                let faults: Vec<_> = out[3][1..].iter().copied().filter(|&page| page != 0).collect();
+                let expected_faults = if missing { &[NEXT_PAGE as u32][..] } else { &[] };
+                assert_eq!(faults, expected_faults, "faults: {case}");
+            }
+        }
+    }
+}
+
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
