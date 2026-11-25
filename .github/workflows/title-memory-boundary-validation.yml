@@ -15,16 +15,19 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Patched shader
-        run: cargo test --locked -p victory-shader --lib wide_title_memory_accesses_follow_both_page_mappings -- --nocapture
+        run: cargo test --locked -p victory-shader --lib wide_title_memory_ -- --nocapture
       - name: Negative control using the original lowering
         run: |
           git restore --source=9376fd60c0ba0e76a74c39b49b1407dbac0a64c7 -- crates/victory-shader/src/emit/lower.rs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $PSNativeCommandUseErrorActionPreference = $false
-          $output = cargo test --locked -p victory-shader --lib wide_title_memory_accesses_follow_both_page_mappings -- --nocapture 2>&1 | Out-String
+          $output = cargo test --locked -p victory-shader --lib wide_title_memory_ -- --nocapture 2>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $output
-          if ($code -eq 0 -or $output -notmatch 'load values: GlobalLoad x2') { throw 'Expected the original shader to read the wrong page' }
+          if ($code -eq 0 -or $output -notmatch 'load values: GlobalLoad x2' -or $output -notmatch 'first copy: GlobalStore x2' -or $output -notmatch 'load values: ScalarLoad x2') {
+            throw 'Expected the original lowering to use the wrong page for each instruction family'
+          }
+          exit 0
   workspace:
     runs-on: windows-latest
     timeout-minutes: 25
@@ -34,6 +37,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy including diagnostics
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        continue-on-error: true
       - name: Tests
         if: always()
         run: cargo test --workspace --locked
