@@ -367,6 +367,8 @@ static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// The most ranges kept between texture passes.
 const MOST_TEXTURE_CHANGES: usize = 1 << 15;
+/// Leave room for a burst of new ranges after compacting under the queue lock.
+const TEXTURE_CHANGE_HEADROOM: usize = MOST_TEXTURE_CHANGES / 8;
 
 /// Keeps a pending texture change. Returns the number of gaps included to
 /// stay within the limit after merging overlaps.
@@ -384,15 +386,16 @@ fn keep_texture_change(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> us
     let mut gaps = 0;
     if ranges.len() == MOST_TEXTURE_CHANGES {
         coalesce_texture_changes(ranges);
-        if ranges.len() == MOST_TEXTURE_CHANGES {
-            // Every range is disjoint. Retain coverage by joining pairs
-            // in address order. The next pass may check a texture in a
-            // gap, but an uploaded texture's only notification survives.
-            gaps = MOST_TEXTURE_CHANGES / 2;
+        let len = ranges.len();
+        gaps = len.saturating_sub(MOST_TEXTURE_CHANGES - TEXTURE_CHANGE_HEADROOM);
+        if gaps != 0 {
+            // Join enough disjoint pairs to leave headroom. The next pass
+            // may check a texture in a gap, but every change is retained.
             for i in 0..gaps {
                 ranges[i] = (ranges[2 * i].0, ranges[2 * i + 1].1);
             }
-            ranges.truncate(gaps);
+            ranges.copy_within(2 * gaps.., gaps);
+            ranges.truncate(len - gaps);
         }
     }
     ranges.push((start, end));
@@ -3555,6 +3558,20 @@ mod tests {
             }
             assert!(next.is_some_and(|&(from, end)| from <= start && end > start), "lost change at {start}");
         }
+    }
+
+    #[test]
+    fn a_nearly_disjoint_texture_burst_leaves_room_after_compaction() {
+        let mut ranges = Vec::new();
+        for i in 0..(MOST_TEXTURE_CHANGES - 1) as u64 {
+            keep_texture_change(&mut ranges, 3 * i, 3 * i + 1);
+        }
+        // The duplicate gives exact coalescing only one slot to reclaim.
+        keep_texture_change(&mut ranges, 0, 1);
+        assert_eq!(ranges.len(), MOST_TEXTURE_CHANGES);
+        let next = 3 * (MOST_TEXTURE_CHANGES - 1) as u64;
+        assert_eq!(keep_texture_change(&mut ranges, next, next + 1), TEXTURE_CHANGE_HEADROOM - 1);
+        assert_eq!(ranges.len(), MOST_TEXTURE_CHANGES - TEXTURE_CHANGE_HEADROOM + 1);
     }
 
     #[test]
