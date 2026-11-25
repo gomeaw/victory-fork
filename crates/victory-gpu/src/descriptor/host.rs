@@ -3452,8 +3452,9 @@ mod tests {
         );
 
         let Some(heap) = HostHeap::new(false, 8) else {
-            return; // no host GPU
+            panic!("the Windows validation run requires a D3D12 descriptor heap");
         };
+        eprintln!("testing both refresh paths with a D3D12 descriptor heap");
         assert!(heap.note_buffer(1, Some(&view), false).is_empty());
         let (slot, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(slot, 1);
