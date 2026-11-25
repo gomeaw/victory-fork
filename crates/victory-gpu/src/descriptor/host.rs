@@ -365,6 +365,32 @@ impl Spans {
 /// [`REMAPPED`] so that what such writes do is counted by itself.
 static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// The most ranges kept between texture passes.
+const MOST_TEXTURE_CHANGES: usize = 1 << 15;
+
+/// Keeps a pending texture change. Returns how many entries had to be dropped.
+fn keep_texture_change(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> usize {
+    if let Some(last) = ranges.last_mut()
+        && last.1 == start
+    {
+        last.1 = end;
+        return 0;
+    }
+    let dropped = if ranges.len() >= MOST_TEXTURE_CHANGES {
+        let dropped = ranges.len();
+        ranges.clear();
+        dropped
+    } else {
+        0
+    };
+    ranges.push((start, end));
+    dropped
+}
+
+fn take_texture_changes(pending: &Mutex<Vec<(u64, u64)>>) -> Vec<(u64, u64)> {
+    std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Since the start: such ranges kept for a pass; ranges dropped because no
 /// pass took them; slots of placed textures that held bytes of them when a
 /// pass took them; of those, the slots whose texture had been uploaded
@@ -386,25 +412,16 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let dropped = keep_texture_change(&mut ranges, start, end);
+    if dropped != 0 {
+        PAGE_WRITES[1].fetch_add(dropped as u64, Relaxed);
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -448,28 +465,16 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let dropped = keep_texture_change(&mut ranges, start, end);
+    if dropped != 0 {
+        STALE[2].fetch_add(dropped as u64, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -1210,9 +1215,12 @@ impl HostHeap {
     /// shortcut: the ranges are kept in one place for all heaps; the heap
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        self.slots_remapped_under(&take_texture_changes(&REMAPPED), frame)
+    }
+
+    fn slots_remapped_under(&self, ranges: &[(u64, u64)], frame: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         if ranges.is_empty() {
             return 0;
         }
@@ -1244,7 +1252,7 @@ impl HostHeap {
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
-        let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let ranges = take_texture_changes(&PAGE_WRITTEN);
         if ranges.is_empty() {
             return 0;
         }
@@ -3452,6 +3460,43 @@ mod tests {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    /// Repeated changes at one address can run the pending queue out of
+    /// entries before another texture's older change is taken.
+    #[test]
+    fn a_streaming_burst_keeps_earlier_texture_changes() {
+        let at = 0x7fea_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        let pending = Mutex::new(Vec::new());
+        {
+            let mut ranges = pending.lock().unwrap();
+            keep_texture_change(&mut ranges, at, at + 0x1000);
+            for i in 0..(2 * MOST_TEXTURE_CHANGES) {
+                let other = at + (2 + (i & 1) as u64) * 0x10000;
+                keep_texture_change(&mut ranges, other, other + 0x1000);
+            }
+        }
+        let ranges = take_texture_changes(&pending);
+        assert!(ranges.iter().any(|&(start, end)| start <= at && end >= at + 0x1000),
+            "the earliest texture change must survive a streaming burst");
+
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        let (slot, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(slot, 1);
+        heap.texture_slot_done(slot, write, None);
+        // Both kinds of notification revive the already uploaded slot.
+        assert_eq!(heap.slots_remapped_under(&ranges, 50), 1);
+        let (slot, write) = heap.texture_slots_due(51, 8).0[0];
+        assert_eq!(slot, 1);
+        heap.texture_slot_done(slot, write, None);
+        assert_eq!(heap.slots_written_under(&ranges, 60, true), [1, 1, 1]);
+        assert_eq!(heap.texture_slots_due(62, 8).0[0].0, 1);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that
